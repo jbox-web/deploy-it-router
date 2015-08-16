@@ -1,0 +1,76 @@
+{{ define "upstream" }}
+  {{ if .Address }}
+    {{/* If we got the containers from swarm and this container's port is published to host, use host IP:PORT */}}
+    {{ if and .Container.Node.ID .Address.HostPort }}
+  # {{ .Container.Node.Name }}/{{ .Container.Name }}
+  server {{ .Container.Node.Address.IP }}:{{ .Address.HostPort }};
+    {{/* If there is no swarm node or the port is not published on host, use container's IP:PORT */}}
+    {{ else }}
+  # {{ .Container.Name }}
+  server {{ .Address.IP }}:{{ .Address.Port }};
+    {{ end }}
+  {{ else }}
+# {{ .Container.Name }}
+server {{ .Container.IP }} down;
+  {{ end }}
+{{ end }}
+
+{{ range $app_id, $containers := groupByMulti $ "Env.APP_ID" "," }}
+upstream {{ $app_id }} {
+{{ range $container := $containers }}
+  {{ if eq (len $container.Addresses) 1 }}
+    {{ $address := index $container.Addresses 0 }}
+    {{ template "upstream" (dict "Container" $container "Address" $address) }}
+  {{ else }}
+    {{ $port := coalesce $container.Env.VIRTUAL_PORT "80" }}
+    {{ $address := where $container.Addresses "Port" $port | first }}
+    {{ template "upstream" (dict "Container" $container "Address" $address) }}
+  {{ end }}
+{{ end }}
+}
+
+{{ $use_ssl := parseBool (first (groupByKeys $containers "Env.USE_SSL")) }}
+{{ $domain_name := (first (groupByKeys $containers "Env.SITE_DNS")) }}
+{{ $domain_aliases := (first (groupByKeys $containers "Env.DOMAIN_ALIASES")) }}
+{{ $domain_redirects := (first (groupByKeys $containers "Env.DOMAIN_REDIRECTS")) }}
+{{ $enable_htpassword := parseBool (first (groupByKeys $containers "Env.ENABLE_HTPASSWORD")) }}
+{{ $password_file := (printf "/etc/nginx/sites-enabled/%s/htpassword" $app_id) }}
+{{ $ssl_cert_file := (printf "/etc/nginx/sites-enabled/%s/ssl/server.crt" $app_id) }}
+{{ $ssl_key_file := (printf "/etc/nginx/sites-enabled/%s/ssl/server.key" $app_id) }}
+{{ $valid_ssl_cert := (and (exists $ssl_cert_file) (exists $ssl_key_file)) }}
+
+server {
+  server_name {{ $domain_name }}{{ range $alias := (split $domain_aliases ",") }} {{ $alias }}{{ end }};
+{{ if (and (eq $use_ssl true) (eq $valid_ssl_cert true)) }}
+  listen      0.0.0.0:443;
+  ssl on;
+  ssl_certificate      {{ $ssl_cert_file }};
+  ssl_certificate_key  {{ $ssl_key_file }};
+{{ else }}
+  listen      0.0.0.0:80;
+{{ end }}
+
+{{ if (and (eq $enable_htpassword true) (exists $password_file)) }}
+  auth_basic           "Restricted";
+  auth_basic_user_file {{ $password_file }};
+{{ end }}
+
+  location / {
+    include /etc/nginx/snippets/deploy-it.conf;
+    proxy_pass http://{{ $app_id }};
+  }
+}
+
+{{ if (or (gt (len $domain_redirects) 0) (eq $use_ssl true)) }}
+server {
+  server_name   {{ if eq $use_ssl true }}{{ $domain_name}}{{ end }}{{ range $redirect := (split $domain_redirects ",") }} {{ $redirect }}{{ end }};
+  listen        0.0.0.0:80;
+{{ if eq $use_ssl true }}
+  return 301 https://{{ $domain_name }}$request_uri;
+{{ else }}
+  return 301 http://{{ $domain_name }}$request_uri;
+{{ end }}
+}
+{{ end }}
+
+{{ end }}
